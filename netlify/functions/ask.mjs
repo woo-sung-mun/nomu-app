@@ -52,33 +52,41 @@ const json = (obj, status = 200) => new Response(JSON.stringify(obj), {
 });
 
 const getEnv = k => (globalThis.Netlify?.env?.get?.(k)) || process.env[k] || '';
-const MODELS = () => [...new Set([getEnv('GEMINI_MODEL'), 'gemini-flash-latest', 'gemini-2.5-flash', 'gemini-flash-lite-latest', 'gemini-2.5-flash-lite', 'gemini-2.0-flash'].filter(Boolean))];
+// 빠른 모델부터 시도합니다(Netlify 무료 함수는 10초 안에 끝나야 함).
+const MODELS = () => [...new Set([getEnv('GEMINI_MODEL'), 'gemini-2.5-flash-lite', 'gemini-flash-lite-latest', 'gemini-2.5-flash', 'gemini-flash-latest'].filter(Boolean))];
 const AUTHS = ['header', 'query', 'bearer'];
+const BUDGET_MS = 9000;
 
-// Gemini 호출: 모델 이름과 인증 방식을 차례로 바꿔 가며 시도합니다.
+// Gemini 호출: 전체 9초 안에서 모델과 인증 방식을 차례로 시도합니다.
 async function callGemini(key, payload) {
   const tried = [];
+  const deadline = Date.now() + BUDGET_MS;
+  let auths = AUTHS;
   for (const model of MODELS()) {
-    for (const auth of AUTHS) {
+    for (const auth of auths) {
+      const left = deadline - Date.now();
+      if (left < 800) return { ok: false, tried, timeout: true };
       let url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
       const headers = { 'Content-Type': 'application/json' };
       if (auth === 'header') headers['x-goog-api-key'] = key;
       if (auth === 'query') url += `?key=${encodeURIComponent(key)}`;
       if (auth === 'bearer') headers['Authorization'] = `Bearer ${key}`;
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), Math.min(left, 6000)); // 한 모델이 6초 넘게 걸리면 다음 모델로
       let r, data;
       try {
-        r = await fetch(url, { method: 'POST', headers, body: JSON.stringify(payload) });
+        r = await fetch(url, { method: 'POST', headers, body: JSON.stringify(payload), signal: ctrl.signal });
         data = await r.json().catch(() => ({}));
       } catch (e) {
-        tried.push({ model, auth, status: 0, message: String(e).slice(0, 200) });
-        continue;
-      }
+        tried.push({ model, auth, status: 0, message: ctrl.signal.aborted ? '시간 초과' : String(e).slice(0, 200) });
+        break;
+      } finally { clearTimeout(timer); }
       if (r.ok) {
         const text = (data.candidates?.[0]?.content?.parts || []).map(x => x.text || '').join('').trim();
         return { ok: true, text, model, auth, tried };
       }
       tried.push({ model, auth, status: r.status, message: String(data?.error?.message || '').slice(0, 300) });
-      if (r.status === 404 || r.status === 429 || r.status >= 500) break; // 모델 없음·혼잡·한도 → 다음 모델로
+      if (![400, 401, 403].includes(r.status)) { auths = [auth]; break; } // 인증은 통과 → 이 방식 고정, 다음 모델로
       // 400/401/403 → 다른 인증 방식 시도
     }
   }
@@ -105,7 +113,7 @@ export default async (req) => {
   const res = await callGemini(key, {
     systemInstruction: { parts: [{ text: p.system }] },
     contents: p.contents,
-    generationConfig: { temperature: 0.3, maxOutputTokens: 4096 }
+    generationConfig: { temperature: 0.3, maxOutputTokens: 1500 }
   });
   if (!res.ok || !res.text) {
     console.error('Gemini failed', JSON.stringify(res.tried));
