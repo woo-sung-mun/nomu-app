@@ -53,17 +53,24 @@ const json = (obj, status = 200) => new Response(JSON.stringify(obj), {
 
 const getEnv = k => (globalThis.Netlify?.env?.get?.(k)) || process.env[k] || '';
 // 빠른 모델부터 시도합니다(Netlify 무료 함수는 10초 안에 끝나야 함).
-const MODELS = () => [...new Set([getEnv('GEMINI_MODEL'), 'gemini-2.5-flash-lite', 'gemini-flash-lite-latest', 'gemini-2.5-flash', 'gemini-flash-latest'].filter(Boolean))];
+// 구글이 "이 모델 대신 models/○○ 을 쓰라"고 알려 주면 그 모델을 바로 다음에 시도합니다.
+const MODELS = () => [...new Set([getEnv('GEMINI_MODEL'), 'gemini-3.5-flash-lite', 'gemini-3.5-flash', 'gemini-flash-lite-latest', 'gemini-flash-latest'].filter(Boolean))];
 const AUTHS = ['header', 'query', 'bearer'];
-const BUDGET_MS = 9000;
+const BUDGET_MS = 9200;
 
-// Gemini 호출: 전체 9초 안에서 모델과 인증 방식을 차례로 시도합니다.
-async function callGemini(key, payload) {
+async function callGemini(key, basePayload) {
   const tried = [];
   const deadline = Date.now() + BUDGET_MS;
+  const queue = MODELS();
+  const seen = new Set();
   let auths = AUTHS;
-  for (const model of MODELS()) {
-    for (const auth of auths) {
+  while (queue.length) {
+    const model = queue.shift();
+    if (seen.has(model)) continue;
+    seen.add(model);
+    let think = model.startsWith('gemini-3');      // 3.x 모델은 생각 단계를 줄여 빠르게
+    for (let i = 0; i < auths.length; i++) {
+      const auth = auths[i];
       const left = deadline - Date.now();
       if (left < 800) return { ok: false, tried, timeout: true };
       let url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
@@ -71,8 +78,10 @@ async function callGemini(key, payload) {
       if (auth === 'header') headers['x-goog-api-key'] = key;
       if (auth === 'query') url += `?key=${encodeURIComponent(key)}`;
       if (auth === 'bearer') headers['Authorization'] = `Bearer ${key}`;
+      const payload = JSON.parse(JSON.stringify(basePayload));
+      if (think) payload.generationConfig = Object.assign({}, payload.generationConfig, { thinkingConfig: { thinkingLevel: 'low' } });
       const ctrl = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), Math.min(left, 6000)); // 한 모델이 6초 넘게 걸리면 다음 모델로
+      const timer = setTimeout(() => ctrl.abort(), Math.min(left, 7000)); // 한 모델이 7초 넘게 걸리면 다음 모델로
       let r, data;
       try {
         r = await fetch(url, { method: 'POST', headers, body: JSON.stringify(payload), signal: ctrl.signal });
@@ -83,11 +92,18 @@ async function callGemini(key, payload) {
       } finally { clearTimeout(timer); }
       if (r.ok) {
         const text = (data.candidates?.[0]?.content?.parts || []).map(x => x.text || '').join('').trim();
-        return { ok: true, text, model, auth, tried };
+        if (text) return { ok: true, text, model, auth, tried };
+        tried.push({ model, auth, status: 200, message: '빈 응답' });
+        break;
       }
-      tried.push({ model, auth, status: r.status, message: String(data?.error?.message || '').slice(0, 300) });
+      const msg = String(data?.error?.message || '');
+      tried.push({ model, auth, status: r.status, message: msg.slice(0, 300) });
+      if (r.status === 400 && think && /think/i.test(msg)) { think = false; i--; continue; } // 생각 설정 미지원 → 설정 빼고 재시도
+      if (r.status === 404) {
+        const sug = [...msg.matchAll(/models\/(gemini-[a-z0-9.\-]*[a-z0-9])/gi)].map(x => x[1]);
+        sug.filter(m => m !== model).reverse().forEach(m => queue.unshift(m));
+      }
       if (![400, 401, 403].includes(r.status)) { auths = [auth]; break; } // 인증은 통과 → 이 방식 고정, 다음 모델로
-      // 400/401/403 → 다른 인증 방식 시도
     }
   }
   return { ok: false, tried };
