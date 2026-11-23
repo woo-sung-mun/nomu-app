@@ -52,7 +52,7 @@ const json = (obj, status = 200) => new Response(JSON.stringify(obj), {
 });
 
 const getEnv = k => (globalThis.Netlify?.env?.get?.(k)) || process.env[k] || '';
-const MODELS = () => [...new Set([getEnv('GEMINI_MODEL'), 'gemini-flash-latest', 'gemini-2.5-flash', 'gemini-2.0-flash'].filter(Boolean))];
+const MODELS = () => [...new Set([getEnv('GEMINI_MODEL'), 'gemini-flash-latest', 'gemini-2.5-flash', 'gemini-flash-lite-latest', 'gemini-2.5-flash-lite', 'gemini-2.0-flash'].filter(Boolean))];
 const AUTHS = ['header', 'query', 'bearer'];
 
 // Gemini 호출: 모델 이름과 인증 방식을 차례로 바꿔 가며 시도합니다.
@@ -78,8 +78,7 @@ async function callGemini(key, payload) {
         return { ok: true, text, model, auth, tried };
       }
       tried.push({ model, auth, status: r.status, message: String(data?.error?.message || '').slice(0, 300) });
-      if (r.status === 404) break;                 // 모델 이름 문제 → 다음 모델
-      if (r.status === 429 || r.status >= 500) return { ok: false, tried }; // 한도/서버 문제 → 중단
+      if (r.status === 404 || r.status === 429 || r.status >= 500) break; // 모델 없음·혼잡·한도 → 다음 모델로
       // 400/401/403 → 다른 인증 방식 시도
     }
   }
