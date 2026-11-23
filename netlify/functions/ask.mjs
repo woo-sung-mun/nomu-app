@@ -1,7 +1,6 @@
 // 사장님 노무비서 · AI 연결 함수 (Netlify Functions)
 // API 키는 Netlify 환경변수 GEMINI_API_KEY 에만 저장되고 화면에는 드러나지 않습니다.
 
-const MODEL = process.env.GEMINI_MODEL || 'gemini-flash-latest';
 
 const BASE = `너는 한국의 자영업자(직원 1~10명 규모 가게 사장님)를 돕는 노무 상담 비서 "노무비서"다.
 - 2026년 기준 한국 근로기준법, 최저임금법, 근로자퇴직급여 보장법을 바탕으로 답한다. 2026년 최저임금은 시급 10,320원이다.
@@ -52,9 +51,51 @@ const json = (obj, status = 200) => new Response(JSON.stringify(obj), {
   headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' }
 });
 
+const getEnv = k => (globalThis.Netlify?.env?.get?.(k)) || process.env[k] || '';
+const MODELS = () => [...new Set([getEnv('GEMINI_MODEL'), 'gemini-flash-latest', 'gemini-2.5-flash', 'gemini-2.0-flash'].filter(Boolean))];
+const AUTHS = ['header', 'query', 'bearer'];
+
+// Gemini 호출: 모델 이름과 인증 방식을 차례로 바꿔 가며 시도합니다.
+async function callGemini(key, payload) {
+  const tried = [];
+  for (const model of MODELS()) {
+    for (const auth of AUTHS) {
+      let url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
+      const headers = { 'Content-Type': 'application/json' };
+      if (auth === 'header') headers['x-goog-api-key'] = key;
+      if (auth === 'query') url += `?key=${encodeURIComponent(key)}`;
+      if (auth === 'bearer') headers['Authorization'] = `Bearer ${key}`;
+      let r, data;
+      try {
+        r = await fetch(url, { method: 'POST', headers, body: JSON.stringify(payload) });
+        data = await r.json().catch(() => ({}));
+      } catch (e) {
+        tried.push({ model, auth, status: 0, message: String(e).slice(0, 200) });
+        continue;
+      }
+      if (r.ok) {
+        const text = (data.candidates?.[0]?.content?.parts || []).map(x => x.text || '').join('').trim();
+        return { ok: true, text, model, auth, tried };
+      }
+      tried.push({ model, auth, status: r.status, message: String(data?.error?.message || '').slice(0, 300) });
+      if (r.status === 404) break;                 // 모델 이름 문제 → 다음 모델
+      if (r.status === 429 || r.status >= 500) return { ok: false, tried }; // 한도/서버 문제 → 중단
+      // 400/401/403 → 다른 인증 방식 시도
+    }
+  }
+  return { ok: false, tried };
+}
+
 export default async (req) => {
+  const key = getEnv('GEMINI_API_KEY').trim();
+
+  // 진단: 브라우저에서 /api/ask 를 열면 연결 상태를 보여 줍니다(키 값은 보여 주지 않음).
+  if (req.method === 'GET') {
+    if (!key) return json({ keySet: false, hint: 'Netlify에 GEMINI_API_KEY 가 등록되지 않았거나 함수에서 읽을 수 없습니다.' });
+    const res = await callGemini(key, { contents: [{ role: 'user', parts: [{ text: '안녕하세요라고만 답해 주세요.' }] }] });
+    return json({ keySet: true, keyStart: key.slice(0, 3), keyLength: key.length, ok: res.ok, model: res.model, auth: res.auth, reply: res.text, tried: res.tried });
+  }
   if (req.method !== 'POST') return json({ error: 'POST only' }, 405);
-  const key = process.env.GEMINI_API_KEY;
   if (!key) return json({ error: 'GEMINI_API_KEY 환경변수가 설정되지 않았습니다.' }, 500);
 
   let body;
@@ -62,28 +103,16 @@ export default async (req) => {
   const p = buildPrompt(body || {});
   if (!p) return json({ error: '지원하지 않는 요청입니다.' }, 400);
 
-  try {
-    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
-      body: JSON.stringify({
-        systemInstruction: { parts: [{ text: p.system }] },
-        contents: p.contents,
-        generationConfig: { temperature: 0.3, maxOutputTokens: 4096 }
-      })
-    });
-    const data = await r.json().catch(() => ({}));
-    if (!r.ok) {
-      console.error('Gemini error', r.status, JSON.stringify(data).slice(0, 500));
-      return json({ error: 'AI 응답 오류', status: r.status }, 502);
-    }
-    const text = (data.candidates?.[0]?.content?.parts || []).map(x => x.text || '').join('').trim();
-    if (!text) return json({ error: 'AI 응답이 비어 있습니다.' }, 502);
-    return json({ text });
-  } catch (e) {
-    console.error('Gemini fetch failed', e);
-    return json({ error: 'AI 연결 실패' }, 502);
+  const res = await callGemini(key, {
+    systemInstruction: { parts: [{ text: p.system }] },
+    contents: p.contents,
+    generationConfig: { temperature: 0.3, maxOutputTokens: 4096 }
+  });
+  if (!res.ok || !res.text) {
+    console.error('Gemini failed', JSON.stringify(res.tried));
+    return json({ error: 'AI 응답 오류', tried: res.tried }, 502);
   }
+  return json({ text: res.text });
 };
 
 export const config = { path: '/api/ask' };
